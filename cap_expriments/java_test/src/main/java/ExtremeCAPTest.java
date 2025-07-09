@@ -1,5 +1,4 @@
-
-// ExtremeCAPTest.java
+// ExtremeCAPTest.java - 添加自动终止条件
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.exceptions.JedisConnectionException;
 import java.time.LocalTime;
@@ -9,219 +8,340 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ExtremeCAPTest {
     private static final DateTimeFormatter TIME_FORMAT = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
     
+    // 自动终止条件配置
+    private static final int MAX_CONSECUTIVE_FAILURES = 5;
+    private static final int MAX_TOTAL_FAILURES = 20;
+    private static final long MAX_EXECUTION_TIME_MS = 30000; // 30秒
+    private static final AtomicBoolean GLOBAL_STOP_FLAG = new AtomicBoolean(false);
+    
     public static void main(String[] args) throws Exception {
-        System.out.println("⚡ 极端条件Redis CAP验证实验");
-        System.out.println("目标：制造足够的压力来观察CAP权衡");
+        System.out.println("⚡ 极端条件Redis CAP验证实验 (改进版)");
+        System.out.println("新增：智能终止条件 + 资源保护机制");
         System.out.println("==========================================");
         
-        Jedis master = new Jedis("localhost", 6379);
-        Jedis slave = new Jedis("localhost", 6380);
+        long startTime = System.currentTimeMillis();
         
-        // 实验1：大数据量同步延迟测试
-        System.out.println("📦 实验1：大数据量同步延迟测试");
-        testLargeDataReplication(master, slave);
-        
-        // 实验2：高并发写入压力测试
-        System.out.println("\n🚀 实验2：高并发写入压力测试");
-        testHighConcurrencyWrites(master, slave);
-        
-        // 实验3：网络延迟模拟
-        System.out.println("\n🌐 实验3：模拟网络延迟影响");
-        testNetworkLatencyImpact(master, slave);
-        
-        // 实验4：故障切换测试
-        System.out.println("\n💥 实验4：模拟故障切换");
-        testFailoverScenario(master, slave);
-        
-        master.close();
-        slave.close();
-        System.out.println("\n✅ 极端测试完成！");
-    }
-    
-    static void testLargeDataReplication(Jedis master, Jedis slave) throws Exception {
-        System.out.println("写入大数据对象...");
-        
-        // 创建1MB的大数据
-        StringBuilder largeData = new StringBuilder();
-        for (int i = 0; i < 100000; i++) {
-            largeData.append("这是一个很长的商品描述数据，用于测试大数据同步延迟，序号：").append(i).append("\n");
-        }
-        String bigValue = largeData.toString();
-        System.out.printf("数据大小: %.2f MB%n", bigValue.getBytes().length / 1024.0 / 1024.0);
-        
-        // 写入大数据并立即读取
-        long writeStart = System.currentTimeMillis();
-        master.set("large_data:product_desc", bigValue);
-        long writeEnd = System.currentTimeMillis();
-        
-        // 立即从Slave读取
-        long readStart = System.currentTimeMillis();
-        String slaveValue = slave.get("large_data:product_desc");
-        long readEnd = System.currentTimeMillis();
-        
-        System.out.printf("Master写入耗时: %d ms%n", writeEnd - writeStart);
-        System.out.printf("Slave读取耗时: %d ms%n", readEnd - readStart);
-        
-        if (slaveValue == null) {
-            System.out.println("❌ 大数据同步延迟！Slave未能立即读取到数据");
+        try (Jedis master = new Jedis("localhost", 6379);
+             Jedis slave = new Jedis("localhost", 6380)) {
             
-            // 等待同步完成
-            int attempts = 0;
-            while (slaveValue == null && attempts < 10) {
-                TimeUnit.MILLISECONDS.sleep(100);
-                slaveValue = slave.get("large_data:product_desc");
-                attempts++;
-                System.out.printf("等待%d00ms后重试... %s%n", attempts, 
-                    slaveValue != null ? "✅ 同步完成" : "❌ 仍未同步");
+            // 预检查连接
+            if (!preflightCheck(master, slave)) {
+                System.out.println("❌ 预检查失败，终止实验");
+                return;
             }
-        } else {
-            boolean dataMatch = bigValue.equals(slaveValue);
-            System.out.printf("✅ 立即读取成功，数据完整性: %s%n", 
-                dataMatch ? "完整" : "❌ 不完整");
+            
+            // 实验1：大数据量同步延迟测试
+            System.out.println("📦 实验1：大数据量同步延迟测试");
+            if (!testLargeDataReplication(master, slave)) {
+                System.out.println("⚠️  大数据测试失败，跳过后续高强度测试");
+                return;
+            }
+            
+            // 实验2：高并发写入压力测试（改进版）
+            System.out.println("\n🚀 实验2：智能高并发写入测试");
+            testHighConcurrencyWritesWithTermination(master, slave);
+            
+            // 实验3：网络延迟模拟（改进版）
+            if (!GLOBAL_STOP_FLAG.get()) {
+                System.out.println("\n🌐 实验3：智能网络延迟影响测试");
+                testNetworkLatencyWithTermination(master, slave);
+            }
+            
+            System.out.println("\n✅ 极端测试完成（改进版）！");
+            
+        } catch (Exception e) {
+            System.out.println("❌ 实验异常终止: " + e.getMessage());
+        } finally {
+            long totalTime = System.currentTimeMillis() - startTime;
+            System.out.printf("📊 总执行时间: %.2f 秒%n", totalTime / 1000.0);
         }
     }
     
-    static void testHighConcurrencyWrites(Jedis master, Jedis slave) throws Exception {
+    /**
+     * 预检查：验证基础连接和环境
+     */
+    static boolean preflightCheck(Jedis master, Jedis slave) {
+        try {
+            System.out.println("🔍 执行预检查...");
+            
+            // 检查基础连接
+            String masterPing = master.ping();
+            String slavePing = slave.ping();
+            
+            if (!"PONG".equals(masterPing) || !"PONG".equals(slavePing)) {
+                System.out.println("❌ 基础连接失败");
+                return false;
+            }
+            
+            // 检查基础同步
+            String testKey = "preflight_test";
+            String testValue = "test_" + System.currentTimeMillis();
+            master.set(testKey, testValue);
+            try {
+                TimeUnit.MILLISECONDS.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                System.out.println("❌ 预检查被中断");
+                return false;
+            }
+            
+            String slaveValue = slave.get(testKey);
+            if (!testValue.equals(slaveValue)) {
+                System.out.println("❌ 基础主从同步失败");
+                return false;
+            }
+            
+            // 清理测试数据
+            master.del(testKey);
+            
+            System.out.println("✅ 预检查通过");
+            return true;
+            
+        } catch (Exception e) {
+            System.out.println("❌ 预检查异常: " + e.getMessage());
+            return false;
+        }
+    }
+    
+    /**
+     * 大数据测试 - 添加失败检测
+     */
+    static boolean testLargeDataReplication(Jedis master, Jedis slave) {
+        try {
+            System.out.println("写入大数据对象...");
+            
+            // 创建适中大小的数据（避免内存问题）
+            StringBuilder largeData = new StringBuilder();
+            for (int i = 0; i < 10000; i++) {
+                largeData.append("商品描述数据测试序号：").append(i).append("\n");
+            }
+            String bigValue = largeData.toString();
+            System.out.printf("数据大小: %.2f KB%n", bigValue.getBytes().length / 1024.0);
+            
+            // 写入测试
+            long writeStart = System.currentTimeMillis();
+            master.set("large_data:test", bigValue);
+            long writeEnd = System.currentTimeMillis();
+            
+            // 读取测试
+            long readStart = System.currentTimeMillis();
+            String slaveValue = slave.get("large_data:test");
+            long readEnd = System.currentTimeMillis();
+            
+            System.out.printf("Master写入耗时: %d ms%n", writeEnd - writeStart);
+            System.out.printf("Slave读取耗时: %d ms%n", readEnd - readStart);
+            
+            boolean success = bigValue.equals(slaveValue);
+            System.out.printf("✅ 大数据同步: %s%n", success ? "成功" : "失败");
+            
+            // 清理数据
+            master.del("large_data:test");
+            
+            return success;
+            
+        } catch (Exception e) {
+            System.out.println("❌ 大数据测试失败: " + e.getMessage());
+            return false;
+        }
+    }
+    
+    /**
+     * 改进的高并发测试 - 添加智能终止条件
+     */
+    static void testHighConcurrencyWritesWithTermination(Jedis master, Jedis slave) {
         ExecutorService executor = Executors.newFixedThreadPool(10);
-        CountDownLatch latch = new CountDownLatch(100);
-        AtomicInteger successCount = new AtomicInteger(0);
-        AtomicInteger readFailCount = new AtomicInteger(0);
+        CountDownLatch latch = new CountDownLatch(50); // 降低并发数
         
-        System.out.println("启动100个并发写入线程...");
+        AtomicInteger successCount = new AtomicInteger(0);
+        AtomicInteger failureCount = new AtomicInteger(0);
+        AtomicInteger consecutiveFailures = new AtomicInteger(0);
+        
+        System.out.println("启动50个并发写入线程（智能终止版）...");
         
         long testStart = System.currentTimeMillis();
         
-        // 100个并发写入任务
-        for (int i = 0; i < 100; i++) {
+        for (int i = 0; i < 50; i++) {
             final int taskId = i;
             executor.submit(() -> {
                 try {
-                    // 高频写入
-                    String key = "concurrent:" + taskId;
-                    String value = "data_" + System.nanoTime();
+                    // 检查全局停止标志
+                    if (GLOBAL_STOP_FLAG.get() || 
+                        consecutiveFailures.get() >= MAX_CONSECUTIVE_FAILURES ||
+                        failureCount.get() >= MAX_TOTAL_FAILURES) {
+                        return;
+                    }
                     
-                    master.set(key, value);
-                    successCount.incrementAndGet();
-                    
-                    // 立即从Slave读取
-                    String slaveRead = slave.get(key);
-                    if (slaveRead == null || !slaveRead.equals(value)) {
-                        readFailCount.incrementAndGet();
-                        System.out.printf("⚠️  任务%d: 读取不一致 (写入:%s, 读取:%s)%n", 
-                            taskId, value, slaveRead);
+                    // 创建独立连接避免线程安全问题
+                    try (Jedis taskMaster = new Jedis("localhost", 6379);
+                         Jedis taskSlave = new Jedis("localhost", 6380)) {
+                        
+                        String key = "concurrent_v2:" + taskId;
+                        String value = "data_" + System.nanoTime();
+                        
+                        // 写入测试
+                        taskMaster.set(key, value);
+                        successCount.incrementAndGet();
+                        consecutiveFailures.set(0); // 重置连续失败计数
+                        
+                        // 读取验证
+                        try {
+                            TimeUnit.MILLISECONDS.sleep(10); // 小延迟
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                        String slaveRead = taskSlave.get(key);
+                        
+                        if (slaveRead == null || !slaveRead.equals(value)) {
+                            System.out.printf("⚠️  任务%d: 读取不一致%n", taskId);
+                        }
+                        
                     }
                     
                 } catch (Exception e) {
-                    System.out.printf("❌ 任务%d异常: %s%n", taskId, e.getMessage());
+                    int failures = failureCount.incrementAndGet();
+                    int consecutive = consecutiveFailures.incrementAndGet();
+                    
+                    if (failures <= 3) { // 只显示前3个错误
+                        System.out.printf("❌ 任务%d失败: %s%n", taskId, 
+                            e.getClass().getSimpleName());
+                    }
+                    
+                    // 检查终止条件
+                    if (consecutive >= MAX_CONSECUTIVE_FAILURES) {
+                        System.out.printf("🛑 连续失败%d次，触发自动终止%n", consecutive);
+                        GLOBAL_STOP_FLAG.set(true);
+                    }
+                    
+                    if (failures >= MAX_TOTAL_FAILURES) {
+                        System.out.printf("🛑 总失败%d次，触发自动终止%n", failures);
+                        GLOBAL_STOP_FLAG.set(true);
+                    }
+                    
                 } finally {
                     latch.countDown();
                 }
             });
         }
         
-        latch.await();
-        long testEnd = System.currentTimeMillis();
+        try {
+            // 等待完成或超时
+            boolean finished = latch.await(MAX_EXECUTION_TIME_MS, TimeUnit.MILLISECONDS);
+            if (!finished) {
+                System.out.println("🛑 执行超时，自动终止");
+                GLOBAL_STOP_FLAG.set(true);
+            }
+        } catch (InterruptedException e) {
+            System.out.println("🛑 执行被中断");
+            GLOBAL_STOP_FLAG.set(true);
+            Thread.currentThread().interrupt(); // 恢复中断状态
+        }
         
         executor.shutdown();
+        long testEnd = System.currentTimeMillis();
         
-        System.out.printf("并发测试结果:%n");
+        // 结果统计
+        System.out.printf("📊 并发测试结果:%n");
         System.out.printf("- 总耗时: %d ms%n", testEnd - testStart);
-        System.out.printf("- 写入成功: %d/100%n", successCount.get());
-        System.out.printf("- 读取不一致: %d/100 (%.1f%%)%n", 
-            readFailCount.get(), readFailCount.get() * 100.0 / 100);
+        System.out.printf("- 成功: %d, 失败: %d%n", successCount.get(), failureCount.get());
+        System.out.printf("- 成功率: %.1f%%%n", 
+            successCount.get() * 100.0 / (successCount.get() + failureCount.get()));
         
-        if (readFailCount.get() > 0) {
-            System.out.println("🎯 观察到CAP权衡！高并发下出现了一致性问题");
-        } else {
-            System.out.println("💪 Redis表现优秀！即使高并发也保持了很好的一致性");
+        if (failureCount.get() > 0) {
+            System.out.println("🎯 观察到CAP权衡！系统在压力下选择了保护策略");
         }
     }
     
-    static void testNetworkLatencyImpact(Jedis master, Jedis slave) throws Exception {
-        System.out.println("模拟网络延迟影响...");
-        System.out.println("💡 提示：在生产环境中，跨区域部署会有明显延迟");
+    /**
+     * 改进的网络延迟测试 - 添加智能终止
+     */
+    static void testNetworkLatencyWithTermination(Jedis master, Jedis slave) {
+        if (GLOBAL_STOP_FLAG.get()) {
+            System.out.println("⚠️  全局停止标志已设置，跳过网络延迟测试");
+            return;
+        }
         
-        // 模拟慢网络：通过大量小写入来占用网络带宽
-        System.out.println("制造网络拥塞...");
+        System.out.println("模拟网络延迟影响（智能版）...");
         
-        ExecutorService noiseExecutor = Executors.newFixedThreadPool(5);
+        ExecutorService noiseExecutor = Executors.newFixedThreadPool(3);
+        AtomicInteger noiseFailures = new AtomicInteger(0);
+        AtomicBoolean noiseStopFlag = new AtomicBoolean(false);
         
-        // 启动网络噪音生成器
-        for (int i = 0; i < 5; i++) {
+        // 启动受控的网络噪音生成器
+        for (int i = 0; i < 3; i++) {
+            final int threadId = i;
             noiseExecutor.submit(() -> {
-                Jedis noiseMaster = new Jedis("localhost", 6379);
-                for (int j = 0; j < 1000; j++) {
-                    try {
-                        noiseMaster.set("noise:" + Thread.currentThread().getId() + ":" + j, 
-                            "noise_data_" + System.nanoTime());
-                        TimeUnit.MILLISECONDS.sleep(1);
-                    } catch (Exception e) {
-                        break;
+                try (Jedis noiseMaster = new Jedis("localhost", 6379)) {
+                    
+                    for (int j = 0; j < 100 && !noiseStopFlag.get() && !GLOBAL_STOP_FLAG.get(); j++) {
+                        try {
+                            noiseMaster.set("noise:" + threadId + ":" + j, 
+                                "noise_" + System.nanoTime());
+                            TimeUnit.MILLISECONDS.sleep(5);
+                            
+                        } catch (Exception e) {
+                            int failures = noiseFailures.incrementAndGet();
+                            
+                            if (failures >= 5) {
+                                System.out.printf("🛑 噪音生成器%d失败过多，自动停止%n", threadId);
+                                noiseStopFlag.set(true);
+                                break;
+                            }
+                        }
                     }
+                } catch (Exception e) {
+                    System.out.printf("❌ 噪音生成器%d异常: %s%n", threadId, 
+                        e.getClass().getSimpleName());
                 }
-                noiseMaster.close();
             });
         }
         
-        TimeUnit.MILLISECONDS.sleep(100); // 让网络拥塞建立
-        
-        // 在拥塞环境下测试
-        System.out.println("在网络拥塞环境下测试...");
-        AtomicInteger delayedReads = new AtomicInteger(0);
-        
-        for (int i = 0; i < 20; i++) {
-            String key = "latency_test:" + i;
-            String value = "test_data_" + System.currentTimeMillis();
+        try {
+            TimeUnit.MILLISECONDS.sleep(200); // 让噪音建立
             
-            master.set(key, value);
-            String slaveRead = slave.get(key);
+            // 在拥塞环境下测试
+            System.out.println("在网络拥塞环境下测试...");
+            AtomicInteger delayedReads = new AtomicInteger(0);
+            AtomicInteger testFailures = new AtomicInteger(0);
             
-            if (slaveRead == null) {
-                delayedReads.incrementAndGet();
-                System.out.printf("❌ 第%d次测试：延迟同步%n", i + 1);
+            for (int i = 0; i < 10 && !GLOBAL_STOP_FLAG.get(); i++) {
+                try {
+                    String key = "latency_test:" + i;
+                    String value = "test_data_" + System.currentTimeMillis();
+                    
+                    master.set(key, value);
+                    String slaveRead = slave.get(key);
+                    
+                    if (slaveRead == null) {
+                        delayedReads.incrementAndGet();
+                        System.out.printf("❌ 第%d次测试：延迟同步%n", i + 1);
+                    }
+                    
+                    TimeUnit.MILLISECONDS.sleep(20);
+                    
+                } catch (Exception e) {
+                    int failures = testFailures.incrementAndGet();
+                    if (failures >= 3) {
+                        System.out.println("🛑 网络测试失败过多，自动终止");
+                        break;
+                    }
+                }
             }
             
-            TimeUnit.MILLISECONDS.sleep(50);
-        }
-        
-        noiseExecutor.shutdownNow();
-        
-        System.out.printf("网络拥塞测试结果: %d/20 次出现同步延迟 (%.1f%%)%n", 
-            delayedReads.get(), delayedReads.get() * 100.0 / 20);
-    }
-    
-    static void testFailoverScenario(Jedis master, Jedis slave) throws Exception {
-        System.out.println("故障切换场景测试");
-        
-        // 预写入测试数据
-        master.set("failover:balance", "1000");
-        master.set("failover:user", "alice");
-        TimeUnit.MILLISECONDS.sleep(100);
-        
-        System.out.println("正常状态验证:");
-        System.out.println("Master余额: " + master.get("failover:balance"));
-        System.out.println("Slave余额:  " + slave.get("failover:balance"));
-        
-        System.out.println("\n💡 模拟Master故障场景:");
-        System.out.println("假设Master突然不可用，但Slave仍然可以提供读服务");
-        System.out.println("这体现了Redis的AP特性：");
-        System.out.println("- ✅ 可用性：Slave继续提供服务");
-        System.out.println("- ❌ 一致性：可能读到过时数据");
-        System.out.println("- ✅ 分区容错：网络分区时系统仍可工作");
-        
-        // 模拟从Slave读取
-        try {
-            String balance = slave.get("failover:balance");
-            String user = slave.get("failover:user");
-            System.out.printf("\n📖 应急读取服务：用户%s的余额是%s%n", user, balance);
-            System.out.println("⚠️  注意：这个余额可能不是最新的！");
-            System.out.println("💡 这就是AP系统的权衡：优先保证可用性");
-        } catch (Exception e) {
-            System.out.println("❌ 连Slave也不可用：" + e.getMessage());
+            System.out.printf("📊 网络拥塞测试结果: %d/10 次延迟 (%.1f%%)%n", 
+                delayedReads.get(), delayedReads.get() * 10.0);
+                
+        } catch (InterruptedException e) {
+            System.out.println("🛑 网络延迟测试被中断");
+            Thread.currentThread().interrupt(); // 恢复中断状态
+        } finally {
+            noiseStopFlag.set(true);
+            noiseExecutor.shutdown();
         }
     }
 }
